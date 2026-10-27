@@ -71,6 +71,16 @@ def transaction(conn: sqlite3.Connection):
     conn.execute("COMMIT")
 
 
+@contextmanager
+def snapshot(conn: sqlite3.Connection):
+    """A read-only transaction: a consistent view of the database that never blocks writers."""
+    conn.execute("BEGIN")
+    try:
+        yield
+    finally:
+        conn.execute("COMMIT")
+
+
 def res(row) -> Res:
     return Res(row["mem"], row["cpu"], row["gpu"], row["disk"])
 

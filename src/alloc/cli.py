@@ -27,6 +27,7 @@ examples:
   alloc run --wait --who agent-7 --mem 10G --time 2h -- python train.py > train.log 2>&1 &
   alloc status              what's running and queued, and when queued jobs should start
   alloc status 42           one job: memory use, time, warnings, exit status
+  alloc watch               live view of the same, for a person at a terminal (q quits)
   alloc cancel 42           stop a job (SIGTERM) or take it out of the queue
   alloc usage --since 1d    resources used per agent
 """
@@ -364,9 +365,55 @@ def print_table(title: str, header: list[str], rows: list[list[str]], first: boo
         print("  " + "  ".join(cell.ljust(width) for cell, width in zip(row, widths)).rstrip())
 
 
-def short_command(row, width: int = 50) -> str:
+def short_command(row, width: int | None = 50) -> str:
     text = shlex.join(json.loads(row["command"]))
-    return text if len(text) <= width else text[: width - 1] + "…"
+    return text if width is None or len(text) <= width else text[: width - 1] + "…"
+
+
+def overview_rows(conn, who: str | None, now: float, recent: int = 10) -> list:
+    """Running and queued jobs in ID order, then up to `recent` that ended in the last day, newest first."""
+    clause = "" if who is None else " AND who = :who"
+    rows = conn.execute(
+        f"SELECT * FROM jobs WHERE state IN ('running', 'pending'){clause} ORDER BY id", {"who": who},
+    ).fetchall()
+    return rows + conn.execute(
+        f"SELECT * FROM jobs WHERE state NOT IN ('running', 'pending'){clause}"
+        " AND ended_at > :since ORDER BY ended_at DESC LIMIT :recent",
+        {"who": who, "since": now - 86400, "recent": recent},
+    ).fetchall()
+
+
+# Columns of the overview tables, shared by `alloc status` and `alloc watch`.
+RUNNING_HEADER = ["ID", "WHO", "ELAPSED", "MEM NOW/PEAK/REQ", "CPU", "GPU", "DISK", "COMMAND"]
+QUEUED_HEADER = ["ID", "WHO", "WAITED", "EST. START", "MEM", "CPU", "GPU", "DISK", "TIME", "COMMAND"]
+FINISHED_HEADER = ["ID", "WHO", "STATE", "RESULT", "RAN", "PEAK MEM", "ENDED", "COMMAND"]
+
+
+def running_cells(r, now: float, command_width: int | None = 50) -> list[str]:
+    return [
+        str(r["id"]), r["who"],
+        f"{fmt_duration(now - r['started_at'])}/{fmt_duration(r['time_limit'])}",
+        "/".join(fmt_size(v) if v else "-" for v in (r["mem_now"], r["mem_peak"], r["mem"])),
+        f"{r['cpu']:g}", f"{r['gpu']:g}", fmt_size(r["disk"]), short_command(r, command_width),
+    ]
+
+
+def queued_cells(r, info: dict, now: float, command_width: int | None = 50) -> list[str]:
+    return [
+        str(r["id"]), r["who"], fmt_duration(now - r["submitted_at"]),
+        fmt_eta(info["estimated_start_in_seconds"]),
+        fmt_size(r["mem"]), f"{r['cpu']:g}", f"{r['gpu']:g}", fmt_size(r["disk"]),
+        fmt_duration(r["time_limit"]), short_command(r, command_width),
+    ]
+
+
+def finished_cells(r, now: float, command_width: int | None = 50) -> list[str]:
+    return [
+        str(r["id"]), r["who"], r["state"], fmt_exit(r["returncode"]),
+        fmt_duration(r["ended_at"] - r["started_at"]) if r["started_at"] else "-",
+        fmt_size(r["mem_peak"]) if r["mem_peak"] else "-",
+        fmt_duration(now - r["ended_at"]) + " ago", short_command(r, command_width),
+    ]
 
 
 def print_overview(cfg: Config, used: Res, rows: list, infos: dict, now: float) -> None:
@@ -378,34 +425,12 @@ def print_overview(cfg: Config, used: Res, rows: list, infos: dict, now: float) 
     pending = [r for r in rows if r["state"] == "pending"]
     finished = [r for r in rows if r["state"] not in ("running", "pending")]
 
-    print_table("running", ["ID", "WHO", "ELAPSED", "MEM NOW/PEAK/REQ", "CPU", "GPU", "DISK", "COMMAND", "NOTES"], [
-        [
-            str(r["id"]), r["who"],
-            f"{fmt_duration(now - r['started_at'])}/{fmt_duration(r['time_limit'])}",
-            "/".join(fmt_size(v) if v else "-" for v in (r["mem_now"], r["mem_peak"], r["mem"])),
-            f"{r['cpu']:g}", f"{r['gpu']:g}", fmt_size(r["disk"]), short_command(r),
-            "WARNING (see alloc status ID)" if infos[r["id"]]["warnings"] else "",
-        ]
+    print_table("running", [*RUNNING_HEADER, "NOTES"], [
+        [*running_cells(r, now), "WARNING (see alloc status ID)" if infos[r["id"]]["warnings"] else ""]
         for r in running
     ])
-    print_table("queued", ["ID", "WHO", "WAITED", "EST. START", "MEM", "CPU", "GPU", "DISK", "TIME", "COMMAND"], [
-        [
-            str(r["id"]), r["who"], fmt_duration(now - r["submitted_at"]),
-            fmt_eta(infos[r["id"]]["estimated_start_in_seconds"]),
-            fmt_size(r["mem"]), f"{r['cpu']:g}", f"{r['gpu']:g}", fmt_size(r["disk"]),
-            fmt_duration(r["time_limit"]), short_command(r),
-        ]
-        for r in pending
-    ])
-    print_table("recently finished", ["ID", "WHO", "STATE", "RESULT", "RAN", "PEAK MEM", "ENDED", "COMMAND"], [
-        [
-            str(r["id"]), r["who"], r["state"], fmt_exit(r["returncode"]),
-            fmt_duration(r["ended_at"] - r["started_at"]) if r["started_at"] else "-",
-            fmt_size(r["mem_peak"]) if r["mem_peak"] else "-",
-            fmt_duration(now - r["ended_at"]) + " ago", short_command(r),
-        ]
-        for r in finished
-    ])
+    print_table("queued", QUEUED_HEADER, [queued_cells(r, infos[r["id"]], now) for r in pending])
+    print_table("recently finished", FINISHED_HEADER, [finished_cells(r, now) for r in finished])
 
 
 def print_job(row, info: dict, now: float) -> None:
@@ -452,16 +477,7 @@ def cmd_status(args, cfg: Config) -> int:
             if rows[0] is None:
                 raise UsageError(f"no job {args.job_id}")
         else:
-            who = "" if args.who is None else " AND who = :who"
-            rows = conn.execute(
-                f"SELECT * FROM jobs WHERE state IN ('running', 'pending'){who} ORDER BY id",
-                {"who": args.who},
-            ).fetchall()
-            rows += conn.execute(
-                f"SELECT * FROM jobs WHERE state NOT IN ('running', 'pending'){who}"
-                " AND ended_at > :since ORDER BY ended_at DESC LIMIT 10",
-                {"who": args.who, "since": now - 86400},
-            ).fetchall()
+            rows = overview_rows(conn, args.who, now)
     infos = {row["id"]: job_info(row, cfg, now, starts, queued) for row in rows}
 
     if args.json:
@@ -572,6 +588,19 @@ def cmd_usage(args, cfg: Config) -> int:
     return 0
 
 
+# --- watch ---------------------------------------------------------------------------------
+
+
+def cmd_watch(args, cfg: Config) -> int:
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        raise UsageError("watch needs a terminal; use `alloc status` instead")
+    if args.interval <= 0:
+        raise UsageError("--interval must be more than zero")
+    from . import watch  # imports curses, which nothing else needs
+
+    return watch.run(cfg, args.who, args.interval)
+
+
 # --- entry point ---------------------------------------------------------------------------
 
 
@@ -600,6 +629,15 @@ def build_parser() -> argparse.ArgumentParser:
     status.add_argument("--who", help="only show jobs from this agent")
     status.add_argument("--json", action="store_true", help="machine-readable output (sizes in bytes)")
     status.set_defaults(func=cmd_status)
+
+    watch = sub.add_parser("watch", help="live view of running, queued and recent jobs",
+                           description="A live view of running, queued and recently finished jobs and "
+                                       "what's reserved, refreshed every second. It only reads the "
+                                       "database, so it never changes the queue. Press q to quit.")
+    watch.add_argument("--who", help="only show jobs from this agent")
+    watch.add_argument("-n", "--interval", type=float, default=1.0, metavar="SECONDS",
+                       help="seconds between refreshes (default: 1)")
+    watch.set_defaults(func=cmd_watch)
 
     cancel = sub.add_parser("cancel", help="stop a running job or remove a queued one",
                             description="Send SIGTERM to a running job, or remove a queued one.")

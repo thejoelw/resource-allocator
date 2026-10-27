@@ -27,6 +27,7 @@ This puts `alloc` on your PATH regardless of which virtualenv an agent is in.
 |---|---|
 | `alloc run [--wait] --who ID --time T [--mem] [--cpu] [--gpu] [--disk] -- CMD...` | reserve and run |
 | `alloc status [JOB_ID] [--who ID] [--json]` | running, queued and recently finished jobs, or one job |
+| `alloc watch [--who ID] [-n SECONDS]` | the same, live in your terminal, plus what's reserved and measured (q quits) |
 | `alloc cancel JOB_ID [--force]` | SIGTERM a running job (`--force`: SIGKILL its process tree), or remove a queued one |
 | `alloc usage [--since 7d] [--json]` | per-agent usage: actual run time × requested resources |
 
@@ -61,7 +62,8 @@ comes out of the same pool as everything else, so `--mem` should cover both.
 Each `alloc run` process supervises its own command; waiting jobs poll the database once
 a second. If an `alloc run` process is killed outright, the next `alloc` invocation
 notices: a queued job is dropped, and a running job keeps its reservation until its
-command exits too.
+command exits too. The exception is `alloc watch`, which only reads the database, so
+leaving it open never affects jobs.
 
 ## Configuration
 
